@@ -1,0 +1,44 @@
+# Track only source, project configuration, and text documentation.
+# New file types must be added explicitly so local scores/assets stay local.
+*
+!/.gitignore
+!/.gitattributes
+!/Cargo.toml
+!/Cargo.lock
+!/build.rs
+!/README.md
+!/LICENSE
+!/THIRD_PARTY.md
+!/licenses/
+!/licenses/**/*.txt
+
+!/src/
+!/src/**/
+!/src/**/*.rs
+!/tests/
+!/tests/**/
+!/tests/**/*.rs
+!/tests/fixtures/core-model-features.json
+!/examples/
+!/examples/**/
+!/examples/**/*.rs
+
+!/docs/
+!/docs/**/
+!/docs/**/*.md
+!/docs/images/
+!/docs/images/*.png
+!/docs/images/*.jpg
+!/assets/
+!/assets/**/
+!/assets/**/*.md
+!/assets/**/*.txt
+!/assets/branding/app-icon.svg
+
+# Exclude local Python tools and caches.
+__pycache__/
+*.py
+*.pyi
+*.ipynb
+*.py[cod]
+/docs/python-reference.md
