@@ -6,6 +6,10 @@
 !/Cargo.toml
 !/Cargo.lock
 !/build.rs
+!/web/
+!/web/*.html
+!/web/*.js
+!/web/*.css
 !/README.md
 !/LICENSE
 !/THIRD_PARTY.md

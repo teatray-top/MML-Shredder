@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#ffffff">
+    <meta name="description" content="MIDI·MMI 악보를 편곡하고 나눠 MMI로 저장합니다.">
+    <title>MML 세단기</title>
+    <link rel="icon" type="image/svg+xml" href="./icon.svg">
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <canvas id="mml-canvas" tabindex="0" aria-label="MML 세단기 악보 편집기"></canvas>
+    <div id="boot" role="status" aria-live="polite">
+      <strong>MML 세단기</strong>
+      <p id="boot-message">불러오는 중…</p>
+      <button id="retry" type="button" hidden>다시 열기</button>
+    </div>
+    <noscript>이 앱을 사용하려면 JavaScript를 켜 주세요.</noscript>
+    <footer id="legal"><a href="./licenses.html" target="_blank" rel="noopener">라이선스</a></footer>
+    <script id="mml-entry" type="module" src="./app.js?v=dev"></script>
+  </body>
+</html>

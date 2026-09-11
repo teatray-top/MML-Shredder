@@ -1,0 +1,53 @@
+/* 시작 안내와 악보 캔버스를 브라우저 전체 화면에 배치합니다. */
+:root {
+  color-scheme: light;
+  font-family: "Pretendard", "Malgun Gothic", sans-serif;
+  color: #18181b;
+  background: #fff;
+}
+
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+
+#mml-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  touch-action: none;
+  opacity: 0;
+}
+
+.ready #mml-canvas { opacity: 1; }
+
+#boot {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  padding: 24px;
+  text-align: center;
+}
+
+#boot strong { font-size: 20px; font-weight: 600; }
+#boot p { margin: 12px 0 0; font-size: 14px; line-height: 1.6; color: #71717a; }
+#retry {
+  margin-top: 20px;
+  border: 1px solid #e4e4e7;
+  border-radius: 5px;
+  padding: 8px 14px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+#retry:hover { background: #f4f4f5; }
+#retry:focus-visible { outline: 2px solid #71717a; outline-offset: 3px; }
+noscript { position: fixed; inset: auto 16px 24px; text-align: center; font-size: 14px; }
+#legal { position: fixed; right: 12px; bottom: 5px; font-size: 11px; line-height: 16px; }
+#legal a { color: #71717a; text-decoration: none; }
+#legal a:hover { color: #18181b; text-decoration: underline; }

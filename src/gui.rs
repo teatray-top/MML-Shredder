@@ -66,9 +66,12 @@ struct Loaded {
 enum JobDone {
     Loaded(Loaded),
     Worked(WorkResult),
+    #[cfg(not(target_arch = "wasm32"))]
     Saved(PathBuf),
 }
 type JobMessage = Result<JobDone, String>;
+#[cfg(target_arch = "wasm32")]
+type WebFileMessage = Result<Option<(String, Vec<u8>)>, String>;
 
 pub struct MmlApp {
     app_icon: egui::TextureHandle,
@@ -87,7 +90,17 @@ pub struct MmlApp {
     split_uses_folded: bool,
     result_polyphony: usize,
     result_notes: usize,
+    #[cfg(not(target_arch = "wasm32"))]
     receiver: Option<mpsc::Receiver<JobMessage>>,
+    #[cfg(target_arch = "wasm32")]
+    web_job: Option<(
+        crate::web::JobWorker,
+        mpsc::Receiver<Result<crate::web_jobs::JobResponse, String>>,
+    )>,
+    #[cfg(target_arch = "wasm32")]
+    web_file: Option<mpsc::Receiver<WebFileMessage>>,
+    #[cfg(target_arch = "wasm32")]
+    web_audio: Option<mpsc::Receiver<Result<(), String>>>,
     status: String,
     error: Option<String>,
     export_path: Option<PathBuf>,
@@ -97,6 +110,7 @@ pub struct MmlApp {
     beats: i64,
     selected_artifact: usize,
     selected_split: usize,
+    #[cfg(not(target_arch = "wasm32"))]
     initial: Option<PathBuf>,
     player: Player,
     timeline: Option<Arc<Timeline>>,
@@ -115,6 +129,8 @@ impl MmlApp {
 
     /// 화면 설정과 공유 아이콘 텍스처를 초기화한다.
     fn with_context(ctx: &egui::Context, initial: Option<PathBuf>) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let _ = initial;
         configure(ctx);
         let icon = crate::window_icon();
         let app_icon = ctx.load_texture(
@@ -145,7 +161,14 @@ impl MmlApp {
             split_uses_folded: false,
             result_polyphony: 0,
             result_notes: 0,
+            #[cfg(not(target_arch = "wasm32"))]
             receiver: None,
+            #[cfg(target_arch = "wasm32")]
+            web_job: None,
+            #[cfg(target_arch = "wasm32")]
+            web_file: None,
+            #[cfg(target_arch = "wasm32")]
+            web_audio: None,
             status: String::new(),
             error: None,
             export_path: None,
@@ -155,6 +178,7 @@ impl MmlApp {
             beats: 32,
             selected_artifact: 0,
             selected_split: 0,
+            #[cfg(not(target_arch = "wasm32"))]
             initial,
             player: Player::default(),
             timeline: None,
@@ -168,7 +192,14 @@ impl MmlApp {
 
     /// 백그라운드 작업이 진행 중인지 확인한다.
     fn busy(&self) -> bool {
-        self.receiver.is_some()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.receiver.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.web_job.is_some() || self.web_file.is_some()
+        }
     }
 
     /// 현재 모드의 작업 대상 원본 또는 편곡 결과를 반환한다.
@@ -416,16 +447,42 @@ impl MmlApp {
     }
 
     /// 현재 상태에 따라 재생하거나 일시정지한다.
-    fn toggle_playback(&mut self) {
+    fn toggle_playback(&mut self, ctx: &egui::Context) {
         if self.player.snapshot().state == PlaybackState::Playing {
             self.player.pause();
         } else if self
             .timeline
             .as_ref()
             .is_some_and(|t| t.duration_seconds() > 0.0)
-            && let Err(error) = self.player.play()
         {
+            self.play(ctx);
+        }
+    }
+
+    /// 가상 악기를 준비한 뒤 사용자 조작으로 재생을 시작한다.
+    fn play(&mut self, _ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        if !crate::web_audio::ready() {
+            if self.web_audio.is_none() {
+                let (tx, rx) = mpsc::channel();
+                self.web_audio = Some(rx);
+                self.status = "가상 악기를 불러오는 중…".into();
+                let ctx = _ctx.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = tx.send(crate::web_audio::prepare().await);
+                    ctx.request_repaint();
+                });
+            }
+            return;
+        }
+        if let Err(error) = self.player.play() {
             self.error = Some(format!("재생할 수 없습니다: {error:#}"));
+        }
+        #[cfg(target_arch = "wasm32")]
+        if self.player.snapshot().state == PlaybackState::Playing
+            && self.status.starts_with("가상 악기 준비 완료")
+        {
+            self.status.clear();
         }
     }
 
@@ -452,6 +509,7 @@ impl MmlApp {
     }
 
     /// 백그라운드 작업을 시작하고 완료 시 화면 갱신을 요청한다.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_job(
         &mut self,
         ctx: &egui::Context,
@@ -475,6 +533,7 @@ impl MmlApp {
     }
 
     /// 선택한 악보 파일을 백그라운드에서 읽는다.
+    #[cfg(not(target_arch = "wasm32"))]
     fn load(&mut self, ctx: &egui::Context, path: PathBuf) {
         if self.busy() {
             return;
@@ -494,6 +553,7 @@ impl MmlApp {
     }
 
     /// 완료된 파일 읽기·변환·저장 작업을 화면 상태에 반영한다.
+    #[cfg(not(target_arch = "wasm32"))]
     fn poll(&mut self) {
         let message = self.receiver.as_ref().and_then(|rx| match rx.try_recv() {
             Ok(v) => Some(v),
@@ -504,22 +564,126 @@ impl MmlApp {
         });
         if let Some(message) = message {
             self.receiver = None;
+            self.accept_job(message);
+        }
+    }
+
+    /// 작업 완료 메시지를 원본·결과·상태에 반영한다.
+    fn accept_job(&mut self, message: JobMessage) {
+        match message {
+            Ok(JobDone::Loaded(source)) => {
+                self.accept_source(source);
+            }
+            Ok(JobDone::Worked(result)) => {
+                self.complete_result(result);
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Ok(JobDone::Saved(path)) => {
+                self.status = format!("저장 완료 · {}", path.display());
+                self.export_path = Some(path);
+            }
+            Err(error) => {
+                self.status = "작업을 완료하지 못했습니다".into();
+                self.error = Some(error);
+            }
+        }
+    }
+
+    /// 브라우저 작업자를 시작해 큰 악보 처리 중에도 화면을 유지한다.
+    #[cfg(target_arch = "wasm32")]
+    fn start_web_job(
+        &mut self,
+        ctx: &egui::Context,
+        status: &str,
+        request: crate::web_jobs::JobRequest,
+    ) {
+        match crate::web::start(request, ctx.clone()) {
+            Ok(job) => {
+                self.web_job = Some(job);
+                self.status = status.into();
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    /// 브라우저에서 고른 파일의 바이트를 작업자에 전달한다.
+    #[cfg(target_arch = "wasm32")]
+    fn load_bytes(&mut self, ctx: &egui::Context, name: String, bytes: Vec<u8>) {
+        if self.busy() {
+            return;
+        }
+        self.player.stop();
+        self.start_web_job(
+            ctx,
+            "악보를 읽고 있습니다…",
+            crate::web_jobs::JobRequest::Load { name, bytes },
+        );
+    }
+
+    /// 브라우저 파일 선택·작업자·가상 악기 준비의 완료를 처리한다.
+    #[cfg(target_arch = "wasm32")]
+    fn poll_web(&mut self, ctx: &egui::Context) {
+        if let Some(message) = self.web_file.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("파일 선택이 중단되었습니다.".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }) {
+            self.web_file = None;
+            self.status.clear();
             match message {
-                Ok(JobDone::Loaded(source)) => {
-                    self.accept_source(source);
+                Ok(Some((name, bytes))) => self.load_bytes(ctx, name, bytes),
+                Ok(None) => {}
+                Err(error) => self.error = Some(error),
+            }
+        }
+        if let Some(message) = self
+            .web_job
+            .as_ref()
+            .and_then(|(_, rx)| match rx.try_recv() {
+                Ok(value) => Some(value),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("작업 연결이 종료되었습니다.".into()))
                 }
-                Ok(JobDone::Worked(result)) => {
-                    self.complete_result(result);
-                }
-                Ok(JobDone::Saved(path)) => {
-                    self.status = format!("저장 완료 · {}", path.display());
-                    self.export_path = Some(path);
-                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            })
+        {
+            self.web_job = None;
+            self.accept_job(message.map(|response| match response {
+                crate::web_jobs::JobResponse::Loaded {
+                    name,
+                    score,
+                    notes,
+                    polyphony,
+                } => JobDone::Loaded(Loaded {
+                    path: PathBuf::from(name),
+                    score: Arc::new(score),
+                    notes,
+                    polyphony,
+                }),
+                crate::web_jobs::JobResponse::Worked(result) => JobDone::Worked(result),
+            }));
+        }
+        if let Some(message) = self.web_audio.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("가상 악기 로딩이 중단되었습니다.".into()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }) {
+            self.web_audio = None;
+            match message {
+                Ok(()) => self.status = "가상 악기 준비 완료 · 재생을 누르세요".into(),
                 Err(error) => {
-                    self.status = "작업을 완료하지 못했습니다".into();
+                    self.status.clear();
                     self.error = Some(error);
                 }
             }
+        }
+        if self.web_audio.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -552,6 +716,18 @@ impl MmlApp {
                     _ => Gain::Shift(self.gain_shift),
                 };
                 let track_files = self.track_files;
+                #[cfg(target_arch = "wasm32")]
+                self.start_web_job(
+                    ctx,
+                    "편곡 중…",
+                    crate::web_jobs::JobRequest::Arrange {
+                        score: (*score).clone(),
+                        options,
+                        stem,
+                        track_files,
+                    },
+                );
+                #[cfg(not(target_arch = "wasm32"))]
                 self.start_job(
                     ctx,
                     "성부를 분석하고 편곡하고 있습니다…",
@@ -567,6 +743,17 @@ impl MmlApp {
             }
             Mode::Split => {
                 let options = self.split.clone();
+                #[cfg(target_arch = "wasm32")]
+                self.start_web_job(
+                    ctx,
+                    "분할 중…",
+                    crate::web_jobs::JobRequest::Split {
+                        score: (*score).clone(),
+                        options,
+                        stem,
+                    },
+                );
+                #[cfg(not(target_arch = "wasm32"))]
                 self.start_job(
                     ctx,
                     "파트별 글자 수를 확인하며 시간축으로 분할하고 있습니다…",
@@ -577,6 +764,7 @@ impl MmlApp {
     }
 
     /// 표시 결과를 선택한 폴더 아래에 저장한다.
+    #[cfg(not(target_arch = "wasm32"))]
     fn save(&mut self, ctx: &egui::Context) {
         if self.busy() {
             return;
@@ -603,6 +791,27 @@ impl MmlApp {
                     )?))
                 },
             );
+        }
+    }
+
+    /// 현재 결과를 하나의 MMI 또는 여러 MMI를 담은 ZIP으로 내려받는다.
+    #[cfg(target_arch = "wasm32")]
+    fn save(&mut self, _ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
+        let outcome = self
+            .export_result()
+            .map_err(|error| format!("{error:#}"))
+            .and_then(|result| {
+                result
+                    .map(|result| crate::web::download(&result.artifacts, &self.stem()))
+                    .transpose()
+            });
+        match outcome {
+            Ok(Some(status)) => self.status = status,
+            Ok(None) => {}
+            Err(error) => self.error = Some(error),
         }
     }
 
@@ -677,6 +886,7 @@ impl MmlApp {
     }
 
     /// 지원 악보를 고르는 파일 대화상자를 연다.
+    #[cfg(not(target_arch = "wasm32"))]
     fn choose_file(&mut self, ctx: &egui::Context) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("악보 파일", &["mmi", "mid", "midi"])
@@ -684,6 +894,21 @@ impl MmlApp {
         {
             self.load(ctx, path);
         }
+    }
+
+    /// 브라우저 파일 선택 창에서 악보를 읽는다.
+    #[cfg(target_arch = "wasm32")]
+    fn choose_file(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.web_file = Some(rx);
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = tx.send(crate::web_file::pick().await);
+            ctx.request_repaint();
+        });
     }
 
     /// 현재 모드의 설정과 실행 버튼을 배치한다.
@@ -1120,6 +1345,7 @@ impl MmlApp {
             self.follow_playhead = false;
         }
         ui.add_space(6.0);
+        let mut play_requested = false;
         ui.horizontal(|ui| {
             let can_play = timeline
                 .as_ref()
@@ -1131,9 +1357,8 @@ impl MmlApp {
                 "재생 · Space"
             };
             if transport_button(ui, can_play && !playing, TransportIcon::Play, play_label).clicked()
-                && let Err(error) = self.player.play()
             {
-                self.error = Some(format!("재생할 수 없습니다: {error:#}"));
+                play_requested = true;
             }
             if transport_button(ui, playing, TransportIcon::Pause, "일시정지 · Space").clicked()
             {
@@ -1212,6 +1437,9 @@ impl MmlApp {
             if let Some(selected) = selected {
                 self.select_split(selected);
             }
+            if play_requested {
+                self.play(ui.ctx());
+            }
             return;
         }
         ui.add_space(8.0);
@@ -1227,6 +1455,9 @@ impl MmlApp {
                     .collect::<Vec<_>>()
             });
         track_controls(ui, &mut self.player, score, widths.as_deref());
+        if play_requested {
+            self.play(ui.ctx());
+        }
         if let Some(result) = &self.result {
             ui.add_space(12.0);
             ui.label(
@@ -1313,21 +1544,38 @@ impl MmlApp {
 impl eframe::App for MmlApp {
     /// 작업 결과와 사용자 입력을 처리하며 앱 화면을 갱신한다.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(not(target_arch = "wasm32"))]
         self.poll();
+        #[cfg(target_arch = "wasm32")]
+        self.poll_web(ctx);
         self.update_playback(ctx);
         if !ctx.wants_keyboard_input()
             && ctx.input_mut(|i| consume_playback_shortcut(&mut i.events))
         {
-            self.toggle_playback();
+            self.toggle_playback(ctx);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = self.initial.take() {
             self.load(ctx, path);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if !self.busy()
             && let Some(path) =
                 ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()))
         {
             self.load(ctx, path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if !self.busy()
+            && let Some(file) = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .find(|file| file.bytes.is_some())
+                    .cloned()
+            })
+        {
+            self.load_bytes(ctx, file.name, file.bytes.unwrap().to_vec());
         }
         if !self.busy() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O))
         {

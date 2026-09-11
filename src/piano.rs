@@ -1,18 +1,72 @@
 //! 내장 Yamaha 피아노 녹음을 음표의 경과시간에 맞춰 재생한다.
 
+use anyhow::Result;
 use rustysynth::SoundFont;
 use std::{io::Cursor, sync::OnceLock};
 
+#[cfg(not(target_arch = "wasm32"))]
 const PIANO: &[u8] = include_bytes!("../assets/soundfonts/YDPGrand/YDP-GrandPiano-20160804.sf2");
 pub(super) const MAX_RELEASE_SECONDS: f64 = 0.81;
 static BANK: OnceLock<SoundFont> = OnceLock::new();
 
 /// 검증된 내장 피아노 음원을 한 번만 읽어 공유한다.
-pub(super) fn load() -> &'static SoundFont {
-    BANK.get_or_init(|| {
+pub(super) fn load() -> Result<&'static SoundFont> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let bank = BANK.get_or_init(|| {
         SoundFont::new(&mut Cursor::new(PIANO))
             .expect("the embedded and tested YDP Grand Piano bank must be valid")
-    })
+    });
+    #[cfg(target_arch = "wasm32")]
+    let bank = BANK
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("피아노를 먼저 불러와 주세요."))?;
+    Ok(bank)
+}
+
+/// 내려받은 피아노 음원의 샘플 범위와 건반 대응을 확인해 공유한다.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn install(bytes: &[u8]) -> Result<()> {
+    if BANK.get().is_some() {
+        return Ok(());
+    }
+    let bank = SoundFont::new(&mut Cursor::new(bytes))?;
+    let preset = bank
+        .get_presets()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("피아노 프리셋이 없습니다."))?;
+    for key in 20..=109 {
+        for velocity in 1..=127 {
+            let preset_region = preset
+                .get_regions()
+                .iter()
+                .find(|region| region.contains(key, velocity))
+                .ok_or_else(|| anyhow::anyhow!("피아노의 건반 정보가 없습니다."))?;
+            let instrument = bank
+                .get_instruments()
+                .get(preset_region.get_instrument_id())
+                .ok_or_else(|| anyhow::anyhow!("피아노의 악기 정보가 잘못되었습니다."))?;
+            let region = instrument
+                .get_regions()
+                .iter()
+                .find(|region| region.contains(key, velocity))
+                .ok_or_else(|| anyhow::anyhow!("피아노의 샘플 정보가 없습니다."))?;
+            anyhow::ensure!(
+                region.get_sample_start() >= 0
+                    && region.get_sample_start() < region.get_sample_end()
+                    && region.get_sample_end() as usize <= bank.get_wave_data().len()
+                    && region.get_sample_id() < bank.get_sample_headers().len(),
+                "피아노의 샘플 범위가 잘못되었습니다."
+            );
+        }
+    }
+    let _ = BANK.set(bank);
+    Ok(())
+}
+
+/// 브라우저의 피아노 음원이 준비되었는지 확인한다.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn ready() -> bool {
+    BANK.get().is_some()
 }
 
 pub(super) struct Tone {
@@ -33,7 +87,7 @@ impl Tone {
         if !(0..=127).contains(&pitch) || velocity <= 0 {
             return None;
         }
-        let bank = load();
+        let bank = load().ok()?;
         let key = pitch.clamp(20, 109);
         // YDP는 preset 영역에서 세기층을 고르므로 instrument 0으로 고정하면 안 된다.
         let preset = bank.get_presets()[0]
@@ -139,8 +193,8 @@ mod tests {
     #[test]
     /// 내장 음원의 다섯 세기층과 반복 없는 꼬리·릴리스 범위를 확인한다.
     fn bundled_grand_has_five_real_layers_and_no_looped_tails() {
-        let bank = load();
-        assert!(std::ptr::eq(bank, load()));
+        let bank = load().unwrap();
+        assert!(std::ptr::eq(bank, load().unwrap()));
         assert_eq!(bank.get_sample_headers().len(), 121);
         assert_eq!(bank.get_presets()[0].get_regions().len(), 5);
         for key in 20..=109 {

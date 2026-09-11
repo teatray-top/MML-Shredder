@@ -12,6 +12,7 @@ use std::{
 };
 
 #[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct Artifact {
     pub name: String,
     pub text: String,
@@ -64,6 +65,7 @@ pub fn game_text(parts: &[Vec<String>]) -> String {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub enum WorkKind {
     Import,
     Fold,
@@ -72,6 +74,7 @@ pub enum WorkKind {
 }
 
 #[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct SplitChunkPreview {
     pub start: i64,
     pub end: i64,
@@ -79,12 +82,14 @@ pub struct SplitChunkPreview {
 }
 
 #[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct SplitPreview {
     pub limit: usize,
     pub chunks: Vec<SplitChunkPreview>,
 }
 
 #[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct WorkResult {
     pub kind: WorkKind,
     pub score: Score,

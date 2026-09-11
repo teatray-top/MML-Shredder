@@ -1,6 +1,6 @@
 # 개발
 
-MML 세단기는 Rust로 작성한 Windows 데스크톱 앱입니다. GUI는 `eframe/egui`, 오디오 출력은 `cpal`, SoundFont 재생은 `rustysynth`를 사용합니다. 프로젝트 코드는 [MIT 라이선스](../LICENSE)이며, 내장 글꼴과 음원에는 각각의 라이선스가 적용됩니다.
+MML 세단기는 Rust로 작성한 Windows·브라우저 앱입니다. GUI는 `eframe/egui`, 오디오 출력은 `cpal`, SoundFont 재생은 `rustysynth`를 사용합니다. 프로젝트 코드는 [MIT 라이선스](../LICENSE)이며, 내장 글꼴과 음원에는 각각의 라이선스가 적용됩니다.
 
 ## 빌드 준비
 
@@ -34,6 +34,61 @@ cargo run --locked --bin mmlfold -- inspect ".\music.mmi"
 ```
 
 `build.rs`는 `assets/branding/app-icon.svg`에서 창 아이콘과 Windows 실행 파일 리소스를 생성합니다. 글꼴을 바꿔 확인하려면 `MMLFOLD_FONT`에 로컬 글꼴 경로를 지정합니다.
+
+## 웹 빌드와 배포
+
+브라우저에서도 같은 Rust 편곡·분할 코드를 사용합니다. 파일 읽기와 계산은 사용자의 브라우저에서 이루어지며, 서버는 정적 파일만 제공합니다. 별도 Web Worker에서 계산하므로 웹 빌드의 Rayon 병렬 처리는 사용하지 않습니다.
+
+처음 한 번 웹 대상을 설치합니다. `wasm-bindgen-cli` 버전은 `Cargo.lock`의 `wasm-bindgen`과 맞춥니다. 현재 잠금 버전은 `0.2.128`입니다.
+
+```powershell
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.128 --locked
+```
+
+저장소 루트에서 웹 실행 파일과 배포 폴더를 만듭니다. 위의 글꼴·모델이 빌드에 필요하며, 두 SoundFont는 실행 파일 밖에 두고 첫 미리듣기 때 내려받습니다.
+
+```powershell
+cargo rustc --release --locked --target wasm32-unknown-unknown --lib --crate-type cdylib
+New-Item -ItemType Directory -Force dist/web/pkg, dist/web/audio | Out-Null
+wasm-bindgen --target web --out-dir dist/web/pkg target/wasm32-unknown-unknown/release/mmlfold.wasm
+Copy-Item web/* dist/web/
+$webInputs = @('dist/web/pkg/mmlfold_bg.wasm', 'dist/web/pkg/mmlfold.js', 'web/app.js', 'web/worker.js', 'web/style.css', 'web/index.html')
+$webHashes = @($webInputs | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() })
+$webHasher = [Security.Cryptography.SHA256]::Create()
+$webDigest = $webHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes(($webHashes -join "`n")))
+$webBuild = [BitConverter]::ToString($webDigest).Replace('-', '').Substring(0, 12).ToLowerInvariant()
+$webHasher.Dispose()
+$webIndex = (Get-Content web/index.html -Raw).Replace('?v=dev', "?v=$webBuild")
+[IO.File]::WriteAllText((Join-Path (Get-Location) 'dist/web/index.html'), $webIndex, [Text.UTF8Encoding]::new($false))
+Copy-Item assets/branding/app-icon.svg dist/web/icon.svg
+Copy-Item assets/soundfonts/YDPGrand/YDP-GrandPiano-20160804.sf2 dist/web/audio/piano.sf2
+Copy-Item assets/soundfonts/FluidR3/FluidR3_GM.sf2 dist/web/audio/instruments.sf2
+```
+
+라이선스 페이지에서 연결하는 원문도 같은 배포 폴더에 복사합니다.
+
+```powershell
+$webNotices = @(
+    'LICENSE',
+    'THIRD_PARTY.md',
+    'licenses/Rust-dependencies.txt',
+    'assets/fonts/OFL-Pretendard.txt',
+    'assets/soundfonts/YDPGrand/CC-BY-3.0.txt',
+    'assets/soundfonts/YDPGrand/YDP-GrandPiano-20160804.txt',
+    'assets/soundfonts/FluidR3/LICENSE.txt',
+    'assets/soundfonts/FluidR3/upstream-README.txt'
+)
+foreach ($notice in $webNotices) {
+    $destination = Join-Path 'dist/web/docs/licenses' $notice
+    New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+    Copy-Item -LiteralPath $notice -Destination $destination
+}
+```
+
+`dist/web/` 전체를 HTTPS 정적 사이트로 배포합니다. 서버에는 Rust·Node.js·Python 실행 환경이 필요하지 않습니다. Caddy의 `root`와 `file_server`를 사용하고, 하위 경로에 배포한다면 앱 주소 끝에 `/`를 유지합니다. 예를 들어 `/mml`은 `/mml/`로 이동시켜야 상대 경로의 작업자·음원이 올바르게 로드됩니다. `.wasm`은 `application/wasm`으로 제공해야 하며 Caddy는 이 형식을 기본 지원합니다.
+
+재배포할 때는 새 폴더에 완성된 파일을 모두 올린 뒤 서비스 경로를 교체해 JS·WASM 버전이 섞이지 않게 합니다. 위 명령은 WASM·JS·CSS·HTML 원본의 해시를 합쳐 SHA256 앞 12자리를 배포 식별자로 넣으므로, 스크립트만 수정해도 값이 바뀝니다. 페이지에서 불러오는 앱·워커·JS·WASM이 같은 `?v=` 값을 사용하므로 CDN에 남아 있는 이전 스크립트를 피할 수 있습니다. HTML은 캐시를 재검증하도록 제공하고, 설정을 바꿨다면 Caddy 설정 검증 후 다시 불러옵니다. 배포 후 MIDI 열기, 편곡, 분할, MMI·ZIP 다운로드, 첫 음원 로딩과 재생을 확인합니다.
 
 ## 검사
 

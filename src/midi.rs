@@ -22,6 +22,18 @@ struct MidiNote {
     program: u8,
 }
 
+#[derive(Debug)]
+struct LaneCapacityExceeded;
+
+impl std::fmt::Display for LaneCapacityExceeded {
+    /// 단선율 파트 한도 초과 메시지를 표시합니다.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MIDI 트랙·채널의 동시발음이 너무 많습니다 (최대 256파트).")
+    }
+}
+
+impl std::error::Error for LaneCapacityExceeded {}
+
 struct Channel {
     keys: [VecDeque<usize>; 128],
     sustained: Vec<usize>,
@@ -42,6 +54,18 @@ impl Default for Channel {
 }
 
 impl Channel {
+    /// 재타건된 음높이의 페달 잔향만 종료하고 아직 눌린 건반은 유지합니다.
+    fn retrigger(&mut self, pitch: u8, time: u64, notes: &mut [MidiNote]) {
+        self.sustained.retain(|&index| {
+            if notes[index].pitch == pitch {
+                notes[index].off = Some(time);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// 페달 상태에 따라 음을 종료하거나 잔향 목록에 보관합니다.
     fn release(&mut self, index: usize, time: u64, notes: &mut [MidiNote]) {
         if self.pedal {
@@ -94,6 +118,14 @@ impl Channel {
 
 /// PPQN 또는 SMPTE 시간의 Type 0·1 MIDI를 MMI 악보로 변환합니다.
 pub fn parse_midi(bytes: &[u8]) -> Result<Score> {
+    match parse_midi_pass(bytes, false) {
+        Err(error) if error.is::<LaneCapacityExceeded>() => parse_midi_pass(bytes, true),
+        result => result,
+    }
+}
+
+/// 지정한 재타건 잔향 정책으로 MIDI를 한 번 변환합니다.
+fn parse_midi_pass(bytes: &[u8], end_retrigger_tails: bool) -> Result<Score> {
     ensure!(
         bytes.len() <= 64 * 1024 * 1024,
         "MIDI 파일이 너무 큽니다 (최대 64 MiB)."
@@ -155,6 +187,9 @@ pub fn parse_midi(bytes: &[u8]) -> Result<Score> {
                             track + 1,
                             pitch
                         );
+                        if end_retrigger_tails {
+                            state.retrigger(pitch, time, &mut notes);
+                        }
                         let index = notes.len();
                         notes.push(MidiNote {
                             on: time,
@@ -373,10 +408,9 @@ fn monophonic_lanes(notes: Vec<Note>) -> Result<Vec<Vec<Note>>> {
         if let Some(index) = best {
             lanes[index].push(note);
         } else {
-            ensure!(
-                lanes.len() < 256,
-                "MIDI 트랙·채널의 동시발음이 너무 많습니다 (최대 256파트)."
-            );
+            if lanes.len() >= 256 {
+                return Err(LaneCapacityExceeded.into());
+            }
             lanes.push(vec![note]);
         }
     }
@@ -516,6 +550,53 @@ fn map_boundaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// 잔향 정리가 눌린 동음과 다른 음높이를 끝내지 않는지 검사합니다.
+    fn retrigger_repair_only_closes_released_matching_pitch() {
+        let mut channel = Channel::default();
+        let mut notes = [60, 60, 64]
+            .into_iter()
+            .map(|pitch| MidiNote {
+                on: 0,
+                off: None,
+                track: 0,
+                port: 0,
+                channel: 0,
+                pitch,
+                velocity: 100,
+                program: 0,
+            })
+            .collect::<Vec<_>>();
+        channel.pedal = true;
+        channel.keys[60].push_back(0);
+        channel.sustained = vec![1, 2];
+        channel.retrigger(60, 96, &mut notes);
+        assert_eq!(notes[0].off, None);
+        assert_eq!(notes[1].off, Some(96));
+        assert_eq!(notes[2].off, None);
+        assert_eq!(channel.keys[60], VecDeque::from([0]));
+        assert_eq!(channel.sustained, [2]);
+        assert!(channel.pedal);
+        channel.release_pedal(192, &mut notes);
+        assert_eq!(notes[0].off, None);
+        assert_eq!(notes[1].off, Some(96));
+        assert_eq!(notes[2].off, Some(192));
+    }
+
+    #[test]
+    /// 파트 수 초과가 다른 파싱 오류와 구분되는 전용 오류인지 검사합니다.
+    fn lane_capacity_error_has_a_distinct_type() {
+        let note = Note {
+            on: 0,
+            off: 96,
+            pitch: 60,
+            vel: 15,
+            src: (0, 0),
+        };
+        let error = monophonic_lanes(vec![note; 257]).unwrap_err();
+        assert!(error.is::<LaneCapacityExceeded>());
+    }
 
     #[test]
     /// 짧은 경계 보정이 정상적인 셋잇단음을 격자에 강제로 맞추지 않는지 검사합니다.

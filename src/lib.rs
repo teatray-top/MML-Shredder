@@ -5,15 +5,30 @@ pub mod core;
 mod core_selection;
 pub mod fold;
 pub mod game_mml;
+mod harmony;
 pub mod input;
 pub mod instruments;
 pub mod midi;
 mod parallel;
 pub mod playback;
 mod salience;
+#[cfg(target_arch = "wasm32")]
+extern crate self as mmlfold;
+#[cfg(target_arch = "wasm32")]
+mod gui;
 pub mod split;
 pub mod synth;
+#[cfg(target_arch = "wasm32")]
+mod typography;
 pub mod verify;
+#[cfg(target_arch = "wasm32")]
+mod web;
+#[cfg(target_arch = "wasm32")]
+pub mod web_audio;
+#[cfg(target_arch = "wasm32")]
+mod web_file;
+#[cfg(target_arch = "wasm32")]
+pub mod web_jobs;
 pub mod workflow;
 
 #[cfg(test)]
@@ -21,10 +36,22 @@ mod performance_tests;
 
 use std::collections::BTreeMap;
 
+/// 빌드 시 생성한 공유 아이콘을 웹 화면에 제공합니다.
+#[cfg(target_arch = "wasm32")]
+fn window_icon() -> eframe::egui::IconData {
+    let rgba: &[u8; 256 * 256 * 4] = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.rgba"));
+    eframe::egui::IconData {
+        rgba: rgba.to_vec(),
+        width: 256,
+        height: 256,
+    }
+}
+
 pub type Tick = i64;
 pub type Tempo = (Tick, i32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct Note {
     pub on: Tick,
     pub off: Tick,
@@ -41,6 +68,7 @@ impl Note {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct Track {
     pub mml: String,
     pub meta: BTreeMap<String, String>,
@@ -49,6 +77,7 @@ pub struct Track {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct Score {
     pub head: Vec<String>,
     pub tracks: Vec<Track>,

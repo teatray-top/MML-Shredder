@@ -59,7 +59,7 @@ fn fits(edges: &[Vec<usize>], first: usize, reserved: &[bool]) -> bool {
     })
 }
 
-/// 넓은 장·단화음에서 선율·베이스·화성음을 함께 남길 후보를 고릅니다.
+/// 명확한 넓은 화음에서 선율·베이스·화성음을 함께 남길 후보를 고릅니다.
 fn chord_edges(
     notes: &[Note],
     batch: &[usize],
@@ -67,6 +67,7 @@ fn chord_edges(
     edges: &[Vec<usize>],
     slots: &[Vec<usize>],
     policy: &Policy<'_>,
+    harmony: Option<crate::harmony::Harmony>,
 ) -> Option<Vec<Vec<usize>>> {
     if policy.parts != 3 || batch.len() <= 3 || policy.count <= 3 {
         return None;
@@ -84,19 +85,16 @@ fn chord_edges(
     if top - bottom < 24 {
         return None;
     }
-    let classes: std::collections::BTreeSet<_> = pitches.iter().map(|p| p.rem_euclid(12)).collect();
-    if classes.len() != 3 {
+    let harmony = harmony?;
+    let classes = pitches
+        .iter()
+        .fold(0u16, |mask, pitch| mask | (1 << pitch.rem_euclid(12)));
+    if classes.count_ones() < 3 {
         return None;
     }
-    let root = (0..12).find(|root| {
-        [3, 4].iter().any(|third| {
-            [*root, (root + third) % 12, (root + 7) % 12]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                == classes
-        })
-    })?;
+    let root = i32::from(harmony.root());
     let fifth = (root + 7) % 12;
+    let plain_triad = harmony.mask().count_ones() == 3 && harmony.mask() & (1 << fifth) != 0;
     // 동음 사본은 가장 긴 길이 하나로 묶어 서로 다른 상성부의 기준을 보존합니다.
     let mut pitch_lengths = BTreeMap::<i32, Tick>::new();
     for &i in batch {
@@ -146,14 +144,18 @@ fn chord_edges(
                     .windows(2)
                     .filter(|pair| pair[0] == pair[1])
                     .count() as f64;
+                let selected_mask = selected
+                    .iter()
+                    .fold(0u16, |mask, pitch| mask | (1 << pitch.rem_euclid(12)));
+                let familiar_voicing = if plain_triad {
+                    0.10 * skeleton + 0.15 * lead_octave + 0.05 * upper_support
+                } else {
+                    0.0
+                };
                 let value = chosen.iter().map(|&j| entry[batch[j]]).sum::<f64>() / 3.0
                     + ambiguity
-                        * (0.25 * bass
-                            + 0.10 * lead
-                            + 0.10 * skeleton
-                            + 0.15 * lead_octave
-                            + 0.05 * upper_support
-                            - 0.15 * unisons);
+                        * (0.25 * bass + 0.10 * lead + familiar_voicing - 0.15 * unisons
+                            + 0.04 * harmony.coverage(selected_mask) / 3.0);
                 if best.as_ref().is_some_and(|(old, _)| value <= *old) {
                     continue;
                 }
@@ -279,6 +281,38 @@ pub(crate) struct Policy<'a> {
     pub(crate) tempos: &'a [Tempo],
 }
 
+/// 강한 원본 선율의 지속음은 무관한 아래 성부보다 빈 보조 파트를 먼저 사용하게 합니다.
+fn held_source_lead(
+    held: usize,
+    incoming: usize,
+    predecessor: &[Option<usize>],
+    successor: &[Option<usize>],
+    policy: &Policy<'_>,
+) -> bool {
+    let note = &policy.originals[held];
+    let next = &policy.originals[incoming];
+    if note.src == next.src
+        || i64::from(note.pitch) - i64::from(next.pitch) < 12
+        || policy.probabilities[held] < 0.85
+        || policy.probabilities[held] + 0.05 < policy.probabilities[incoming]
+    {
+        return false;
+    }
+    [predecessor[held], successor[held]]
+        .into_iter()
+        .flatten()
+        .any(|neighbor| {
+            let adjacent = &policy.originals[neighbor];
+            let gap = if adjacent.on < note.on {
+                note.on - adjacent.off
+            } else {
+                adjacent.on - note.off
+            };
+            (0..=96).contains(&gap)
+                && (i64::from(adjacent.pitch) - i64::from(note.pitch)).abs() <= 12
+        })
+}
+
 /// 공격별 우선도와 정확한 음가 제약에 따라 핵심 및 보조 파트에 배치합니다.
 pub(crate) fn schedule(
     notes: &mut [Note],
@@ -289,16 +323,42 @@ pub(crate) fn schedule(
     let mut core = vec![false; notes.len()];
     let mut entry = vec![0.0; notes.len()];
     let mut predecessor = vec![None; notes.len()];
+    let mut successor = vec![None; notes.len()];
     let mut previous = BTreeMap::new();
     // 탈락한 원본 음도 이웃 계산에 포함해 그 음을 건너 연결하지 않습니다.
     for (i, note) in policy.originals.iter().enumerate() {
         predecessor[i] = previous.insert(note.src, i);
+        if let Some(previous) = predecessor[i] {
+            successor[previous] = Some(i);
+        }
     }
     let mut events: BTreeMap<Tick, Vec<usize>> = BTreeMap::new();
     for &i in kept {
         events.entry(notes[i].on).or_default().push(i);
     }
+    // 탈락한 음도 원래 끝나는 시점까지 화음 문맥에 남깁니다.
+    let mut original_events: Vec<_> = (0..policy.originals.len()).collect();
+    original_events.sort_by_key(|&i| policy.originals[i].on);
+    let mut original_cursor = 0;
+    let mut original_sounding = Vec::new();
     for (tick, mut batch) in events {
+        original_sounding.retain(|&i: &usize| policy.originals[i].off > tick);
+        while original_cursor < original_events.len()
+            && policy.originals[original_events[original_cursor]].on <= tick
+        {
+            let i = original_events[original_cursor];
+            if policy.originals[i].off > tick {
+                original_sounding.push(i);
+            }
+            original_cursor += 1;
+        }
+        let harmony = (batch.len() > 3)
+            .then(|| {
+                crate::harmony::analyze(
+                    original_sounding.iter().map(|&i| policy.originals[i].pitch),
+                )
+            })
+            .flatten();
         for &i in &batch {
             let affinity = predecessor[i].map_or(0.0, |j| {
                 let gap = tick - policy.originals[j].off;
@@ -361,6 +421,16 @@ pub(crate) fn schedule(
                     });
                     let tier = if slot >= policy.parts {
                         2
+                    } else if held
+                        && held_source_lead(
+                            last.expect("held note"),
+                            i,
+                            &predecessor,
+                            &successor,
+                            policy,
+                        )
+                    {
+                        3
                     } else {
                         usize::from(held)
                     };
@@ -386,7 +456,7 @@ pub(crate) fn schedule(
                 edges = proposed;
             }
         }
-        if let Some(joint) = chord_edges(notes, &batch, &entry, &edges, &slots, policy) {
+        if let Some(joint) = chord_edges(notes, &batch, &entry, &edges, &slots, policy, harmony) {
             edges = joint;
         }
         let mut reserved = vec![false; policy.count];
@@ -820,5 +890,191 @@ mod tests {
                 .to_string()
                 .contains("rest after final attack")
         );
+    }
+
+    #[test]
+    /// 분산 반주의 중간 진입이 이어지는 옥타브 선율을 자르거나 보조 트랙으로 밀지 않습니다.
+    fn interleaved_accompaniment_preserves_the_ongoing_source_melody() {
+        for transpose in [-24, 0, 12] {
+            let rows = [
+                (0, 48, 96, 0),
+                (0, 48, 84, 1),
+                (0, 30, 48, 2),
+                (0, 30, 36, 3),
+                (30, 66, 60, 2),
+                (30, 66, 55, 3),
+                (48, 96, 91, 0),
+                (48, 96, 79, 1),
+                (66, 96, 64, 2),
+                (66, 96, 60, 3),
+            ];
+            let mut notes: Vec<_> = rows
+                .map(|(on, off, pitch, source)| Note {
+                    src: (source, 0),
+                    ..n(on, off, pitch + transpose)
+                })
+                .into();
+            let original = notes.clone();
+            let slots = run(
+                &mut notes,
+                &[
+                    0.995, 0.949, 0.897, 0.392, 0.99, 0.97, 0.998, 0.938, 0.99, 0.97,
+                ],
+                3,
+                6,
+                &[],
+            );
+            for index in [0, 1, 6, 7] {
+                assert_eq!(notes[index], original[index]);
+                assert!(slots[..3].iter().any(|part| part.contains(&index)));
+            }
+            assert!(
+                slots[..3]
+                    .iter()
+                    .any(|part| part.contains(&0) && part.contains(&6))
+            );
+            assert!(
+                slots[..3]
+                    .iter()
+                    .any(|part| part.contains(&1) && part.contains(&7))
+            );
+            assert_eq!(slots.iter().flatten().count(), notes.len());
+        }
+    }
+
+    #[test]
+    /// 한 박이 지난 긴 상성부도 같은 원본 선율로 이어지면 아래 반주에 잘리지 않습니다.
+    fn sustained_source_melody_outlasts_multiple_lower_attacks() {
+        let rows = [
+            (0, 24, 77, 0),
+            (0, 24, 65, 1),
+            (48, 240, 89, 0),
+            (48, 240, 77, 1),
+            (48, 78, 60, 2),
+            (48, 78, 56, 3),
+            (78, 114, 60, 2),
+            (78, 114, 55, 3),
+            (114, 144, 56, 2),
+            (114, 144, 51, 3),
+            (144, 162, 39, 2),
+            (144, 162, 27, 3),
+            (240, 288, 87, 0),
+            (240, 288, 75, 1),
+        ];
+        let mut notes: Vec<_> = rows
+            .map(|(on, off, pitch, source)| Note {
+                src: (source, 0),
+                ..n(on, off, pitch)
+            })
+            .into();
+        let original = notes.clone();
+        let slots = run(
+            &mut notes,
+            &[
+                0.99, 0.97, 0.998, 0.97, 0.95, 0.90, 0.998, 0.90, 0.998, 0.92, 0.97, 0.85, 0.99,
+                0.97,
+            ],
+            3,
+            6,
+            &[],
+        );
+        for index in [2, 3] {
+            assert_eq!(notes[index], original[index]);
+            assert!(slots[..3].iter().any(|part| part.contains(&index)));
+        }
+        assert_eq!(slots.iter().flatten().count(), notes.len());
+    }
+
+    #[test]
+    /// 단지 높거나 판단이 약한 지속음은 새 공격보다 무조건 우선하지 않습니다.
+    fn isolated_or_weaker_high_notes_can_still_yield() {
+        for (has_neighbor, held_score, new_score) in
+            [(false, 0.98, 0.95), (true, 0.50, 0.80), (true, 0.85, 0.98)]
+        {
+            let mut notes = vec![n(0, 192, 84), n(30, 78, 60)];
+            let mut probabilities = vec![held_score, new_score];
+            if has_neighbor {
+                let mut neighbor = n(192, 240, 86);
+                neighbor.src = notes[0].src;
+                notes.push(neighbor);
+                probabilities.push(held_score);
+            }
+            let slots = run(&mut notes, &probabilities, 1, 2, &[]);
+            assert_eq!(notes[0].off, 30);
+            assert!(slots[0].contains(&1));
+        }
+    }
+
+    #[test]
+    /// 다른 파트가 이미 울리고 있으면 선율 보호보다 모든 새 공격의 배치를 우선합니다.
+    fn source_lead_preference_does_not_make_attack_placement_infeasible() {
+        let mut notes = vec![n(0, 192, 84), n(0, 192, 40), n(30, 78, 60), n(192, 240, 86)];
+        notes[3].src = notes[0].src;
+        let slots = run(&mut notes, &[0.98, 0.90, 0.95, 0.98], 1, 2, &[]);
+        assert_eq!(notes[0].off, 30);
+        assert!(slots[0].contains(&2));
+        assert_eq!(slots.iter().flatten().count(), notes.len());
+    }
+
+    #[test]
+    /// 명확한 7화음의 비슷한 후보 중 중복보다 아직 없는 7음을 함께 남깁니다.
+    fn clear_seventh_chord_coverage_prefers_an_unrepresented_member() {
+        for transpose in [-12, 0, 12] {
+            let mut notes: Vec<_> = [36, 48, 52, 55, 58, 64]
+                .into_iter()
+                .map(|pitch| n(0, 96, pitch + transpose))
+                .collect();
+            let original = notes.clone();
+            let slots = run(&mut notes, &[0.4; 6], 3, 6, &[]);
+            let selected: std::collections::BTreeSet<_> = slots[..3]
+                .iter()
+                .flatten()
+                .map(|&index| notes[index].pitch - transpose)
+                .collect();
+            assert_eq!(selected, [36, 58, 64].into_iter().collect());
+            assert_eq!(notes, original);
+            assert_eq!(slots.iter().flatten().count(), notes.len());
+        }
+    }
+
+    #[test]
+    /// 탈락한 비화성음도 원래 울리는 동안 판정을 보류하고 끝난 뒤에만 보정을 허용합니다.
+    fn removed_nonchord_tones_remain_in_the_original_harmonic_context() {
+        for transpose in [-12, 0, 12] {
+            for (on, off, active) in [(0, 192, true), (96, 192, true), (0, 96, false)] {
+                let mut originals: Vec<_> = [12, 36, 52, 55, 59, 88]
+                    .into_iter()
+                    .map(|pitch| n(96, 192, pitch + transpose))
+                    .collect();
+                originals.push(n(on, off, 63 + transpose));
+                let mut notes = originals.clone();
+                notes[6].off = notes[6].on;
+                let before = notes.clone();
+                let slots = schedule(
+                    &mut notes,
+                    &[0, 1, 2, 3, 4, 5],
+                    &Policy {
+                        originals: &originals,
+                        probabilities: &[0.4; 7],
+                        anchors: &[false; 7],
+                        parts: 3,
+                        count: 6,
+                        tempos: &[],
+                    },
+                )
+                .unwrap();
+                let selected: std::collections::BTreeSet<_> = slots[..3]
+                    .iter()
+                    .flatten()
+                    .map(|&i| notes[i].pitch - transpose)
+                    .collect();
+                let expected = if active { [12, 36, 52] } else { [12, 59, 88] };
+                assert_eq!(selected, expected.into_iter().collect());
+                assert_eq!(notes, before);
+                let mut assigned: Vec<_> = slots.into_iter().flatten().collect();
+                assigned.sort_unstable();
+                assert_eq!(assigned, [0, 1, 2, 3, 4, 5]);
+            }
+        }
     }
 }

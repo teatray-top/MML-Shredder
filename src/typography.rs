@@ -1,12 +1,15 @@
 //! 한글 UI 글꼴과 픽셀 정렬을 설정한다.
 
-use std::{path::PathBuf, sync::Arc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
 
 /// 내장 한글 글꼴과 글리프·벡터의 픽셀 정렬을 설정한다.
 pub fn configure(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    #[cfg(not(target_arch = "wasm32"))]
     let font = std::env::var_os("MMLFOLD_FONT")
         .map(PathBuf::from)
         .and_then(|path| std::fs::read(path).ok())
@@ -14,6 +17,9 @@ pub fn configure(ctx: &egui::Context) {
         .unwrap_or_else(|| {
             egui::FontData::from_static(include_bytes!("../assets/fonts/Pretendard-Regular.ttf"))
         });
+    #[cfg(target_arch = "wasm32")]
+    let font =
+        egui::FontData::from_static(include_bytes!("../assets/fonts/Pretendard-Regular.ttf"));
 
     let name = "korean-ui".to_owned();
     fonts.font_data.insert(name.clone(), Arc::new(font));

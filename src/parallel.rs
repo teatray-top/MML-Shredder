@@ -1,10 +1,14 @@
 //! 음성 콜백 밖의 독립 작업을 입력 순서대로 병렬 처리합니다.
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 
+#[cfg(not(target_arch = "wasm32"))]
 const MIN_WORK: usize = 16_384;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// 사용 가능한 코어 수에 맞춘 공용 작업 풀을 준비합니다.
 fn pool() -> Option<&'static ThreadPool> {
     static POOL: OnceLock<Option<ThreadPool>> = OnceLock::new();
@@ -22,6 +26,7 @@ fn pool() -> Option<&'static ThreadPool> {
     .as_ref()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// 작업량에 따라 순차 또는 병렬로 계산하고 입력 순서로 결과를 반환합니다.
 pub(crate) fn map<T, U, F>(items: &[T], work: usize, operation: F) -> Vec<U>
 where
@@ -49,7 +54,18 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(target_arch = "wasm32")]
+/// 웹 작업자 안에서 입력 순서대로 계산합니다.
+pub(crate) fn map<T, U, F>(items: &[T], _work: usize, operation: F) -> Vec<U>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> U + Send + Sync,
+{
+    items.iter().map(operation).collect()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

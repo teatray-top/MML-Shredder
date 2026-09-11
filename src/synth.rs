@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[path = "piano.rs"]
-mod piano;
+pub(crate) mod piano;
 
 const TICKS_PER_QUARTER: f64 = 96.0;
 const RELEASE_SECONDS: f64 = piano::MAX_RELEASE_SECONDS;
@@ -355,19 +355,37 @@ struct PendingOff {
 
 impl Renderer {
     /// 모든 파트가 켜진 샘플 시계 렌더러를 만든다.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(timeline: Arc<Timeline>, sample_rate: u32) -> Self {
+        Self::try_new(timeline, sample_rate)
+            .expect("supported sample rate and verified embedded instrument banks")
+    }
+
+    /// 음원이 준비되었는지 확인하고 모든 파트가 켜진 렌더러를 만든다.
+    pub fn try_new(timeline: Arc<Timeline>, sample_rate: u32) -> Result<Self> {
         let audibility = Audibility::all(&timeline);
-        Self::with_audibility(timeline, sample_rate, audibility)
+        Self::try_with_audibility(timeline, sample_rate, audibility)
     }
 
     /// 선택 상태에 맞춰 음원과 파트별 렌더러를 미리 준비한다.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn with_audibility(
         timeline: Arc<Timeline>,
         sample_rate: u32,
         audibility: Audibility,
     ) -> Self {
+        Self::try_with_audibility(timeline, sample_rate, audibility)
+            .expect("supported sample rate and verified embedded instrument banks")
+    }
+
+    /// 선택 상태와 음원 준비 여부를 확인하며 파트별 렌더러를 만든다.
+    pub(crate) fn try_with_audibility(
+        timeline: Arc<Timeline>,
+        sample_rate: u32,
+        audibility: Audibility,
+    ) -> Result<Self> {
         let sample_rate = sample_rate.clamp(16_000, 192_000);
-        piano::load();
+        piano::load()?;
         let instrument_parts = timeline
             .part_counts
             .iter()
@@ -375,20 +393,19 @@ impl Renderer {
             .map(|(ti, &count)| {
                 (0..count)
                     .map(|pi| {
-                        let mut synth = PartSynth::new(sample_rate)
-                            .expect("supported sample rate and verified embedded instrument bank");
+                        let mut synth = PartSynth::new(sample_rate)?;
                         synth.set_instrument(audibility.part_instrument(ti, pi));
-                        InstrumentPart {
+                        Ok(InstrumentPart {
                             synth,
                             gate_gain: f64::from(audibility.enabled(ti, pi)),
                             render_until: 0.0,
-                        }
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let sample_rate = f64::from(sample_rate.max(1));
-        Self {
+        Ok(Self {
             voices: Vec::with_capacity(timeline.voice_capacity),
             pending_offs: Vec::with_capacity(timeline.voice_capacity),
             instrument_parts,
@@ -401,7 +418,7 @@ impl Renderer {
             fade_frames: (sample_rate * SEEK_FADE_SECONDS).ceil() as u64,
             audibility,
             gate_step: 1.0 / (sample_rate * GATE_FADE_SECONDS).max(1.0),
-        }
+        })
     }
 
     /// 트랙의 소리 선택 상태를 반환한다.

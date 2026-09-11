@@ -7,7 +7,11 @@ use anyhow::{Context, Result, ensure};
 use crate::core::{MIN_TICK, WHOLE, emit_part, track_from_mml};
 use crate::{Note, Score, Tick};
 
+#[cfg(test)]
+mod anchor_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub enum Layout {
     Voices,
     Hands,
@@ -28,6 +32,7 @@ impl Layout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub enum Gain {
     None,
     Auto,
@@ -35,6 +40,7 @@ pub enum Gain {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct VolumeRange {
     pub min: i32,
     pub max: i32,
@@ -52,6 +58,7 @@ impl VolumeRange {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct FoldOptions {
     pub tracks: usize,
     pub parts: usize,
@@ -195,6 +202,8 @@ fn reduce(
     let mut events: Vec<_> = (0..notes.len()).collect();
     events.sort_by_key(|&i| notes[i].note.on);
     let mut active = Vec::new();
+    let original_ends: Vec<_> = notes.iter().map(|n| n.note.off).collect();
+    let mut sounding = Vec::new();
     let mut next = 0;
     let mut stats = FoldStats {
         total: notes.len(),
@@ -203,14 +212,22 @@ fn reduce(
     while next < events.len() {
         let tick = notes[events[next]].note.on;
         active.retain(|&i: &usize| notes[i].note.off > tick);
+        sounding.retain(|&i: &usize| original_ends[i] > tick);
         while next < events.len() && notes[events[next]].note.on == tick {
             active.push(events[next]);
+            sounding.push(events[next]);
             next += 1;
         }
+        // 이미 버린 음으로 화음 해석이 바뀌지 않도록 원본의 동시음을 읽습니다.
+        let harmony = (active.len() > limit)
+            .then(|| crate::harmony::analyze(sounding.iter().map(|&i| notes[i].note.pitch)))
+            .flatten();
         while active.len() > limit {
             let mut seen = BTreeMap::<i32, usize>::new();
+            let mut pitch_classes = [0usize; 12];
             for &i in &active {
                 *seen.entry(notes[i].note.pitch).or_default() += 1;
+                pitch_classes[notes[i].note.pitch.rem_euclid(12) as usize] += 1;
             }
             let lo = *seen.first_key_value().expect("active notes").0;
             let hi = *seen.last_key_value().expect("active notes").0;
@@ -226,6 +243,11 @@ fn reduce(
                 }
                 if p == lo {
                     value += 95.0;
+                }
+                if pitch_classes[p.rem_euclid(12) as usize] == 1
+                    && let Some(harmony) = harmony
+                {
+                    value += 80.0 * harmony.weight(p);
                 }
                 let age = tick - n.note.on;
                 // 여기서 제거한 공격은 이후 배정에서 복구할 수 없으므로 페달 꼬리의 유지 점수도 감쇠합니다.
@@ -420,30 +442,41 @@ fn learned_homes(
     Ok(homes)
 }
 
-/// 각 공격 시점의 주선율 후보를 표시합니다.
-fn attack_anchors(notes: &[WorkingNote], kept: &[usize], options: &FoldOptions) -> Vec<bool> {
+/// 원래 성부 안의 선율 연결을 비교해 각 공격 시점의 주선율 후보를 표시합니다.
+fn attack_anchors(
+    notes: &[WorkingNote],
+    originals: &[Note],
+    kept: &[usize],
+    options: &FoldOptions,
+) -> Vec<bool> {
     let mut events: BTreeMap<Tick, Vec<usize>> = BTreeMap::new();
     for &i in kept {
         events.entry(notes[i].note.on).or_default().push(i);
     }
     let mut anchors = vec![false; notes.len()];
-    let mut previous: Option<i32> = None;
+    let mut previous = BTreeMap::<_, &Note>::new();
+    let continuity: Vec<_> = originals
+        .iter()
+        .map(|note| {
+            let prior = previous.insert(note.src, note);
+            prior
+                .filter(|prior| (0..=96).contains(&(note.on - prior.off)))
+                .map_or(0.0, |prior| f64::from((note.pitch - prior.pitch).abs()))
+        })
+        .collect();
     for candidates in events.values() {
         let value = |i: usize| {
             let n = &notes[i];
             3.0 * f64::from(n.original_velocity)
                 + 40.0 * n.onset_activity
                 + options.lead_pitch * f64::from(n.note.pitch)
-                - previous.map_or(0.0, |pitch| {
-                    options.lead_continuity * f64::from((n.note.pitch - pitch).abs())
-                })
+                - options.lead_continuity * continuity[i]
         };
         let best = *candidates
             .iter()
             .min_by(|&&a, &&b| value(b).total_cmp(&value(a)).then(a.cmp(&b)))
             .expect("nonempty onset");
         anchors[best] = true;
-        previous = Some(notes[best].note.pitch);
     }
     anchors
 }
@@ -1133,7 +1166,7 @@ fn fold_score_with_reduction(
             &crate::attack_selection::Policy {
                 originals: &originals,
                 probabilities,
-                anchors: &attack_anchors(&notes, &kept, options),
+                anchors: &attack_anchors(&notes, &originals, &kept, options),
                 parts: options.parts,
                 count,
                 tempos: &score.tempos(),

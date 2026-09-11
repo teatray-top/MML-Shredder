@@ -215,6 +215,94 @@ fn sustain_is_shared_by_channel_across_tracks_and_keeps_repeated_attacks() {
 }
 
 #[test]
+/// 파트 한도를 넘는 페달 반복음만 복구하고 다른 채널·포트의 잔향은 보존하는지 검사합니다.
+fn over_capacity_pedal_retriggers_recover_without_touching_other_channels_or_ports() {
+    let count = 512_u32;
+    let mut events = vec![(0, cc(0, 64, 127))];
+    for index in 0..count {
+        events.push((index * 96, on(0, 60, 127)));
+        events.push((index * 96 + 48, on(0, 60, 0)));
+    }
+    events.extend([(count * 96, cc(0, 64, 0)), (count * 96, end())]);
+    let mut separate_channel = vec![(0, cc(1, 64, 127)), (0, on(1, 60, 100))];
+    separate_channel.extend([
+        (48, on(1, 60, 0)),
+        (count * 96, cc(1, 64, 0)),
+        (count * 96, end()),
+    ]);
+    let separate_port = vec![
+        (0, TrackEventKind::Meta(MetaMessage::MidiPort(1.into()))),
+        (0, cc(0, 64, 127)),
+        (0, on(0, 60, 64)),
+        (48, on(0, 60, 0)),
+        (count * 96, cc(0, 64, 0)),
+        (count * 96, end()),
+    ];
+    let score = midi::parse_midi(&midi_bytes(
+        Format::Parallel,
+        96,
+        vec![events, separate_channel, separate_port],
+    ))
+    .unwrap();
+    let mut expected = (0..count)
+        .map(|index| (i64::from(index * 96), i64::from((index + 1) * 96), 60, 15))
+        .collect::<Vec<_>>();
+    expected.extend([
+        (0, i64::from(count * 96), 60, 12),
+        (0, i64::from(count * 96), 60, 8),
+    ]);
+    expected.sort();
+    assert_eq!(note_keys(&score), expected);
+    assert_eq!(score.tracks.len(), 3);
+    assert_round_trip(&score);
+}
+
+#[test]
+/// 실제로 눌린 동시음이 한도를 넘으면 재시도에서도 어택을 삭제하지 않고 오류를 반환합니다.
+fn over_capacity_held_keys_are_not_removed_to_force_an_import() {
+    let mut events = Vec::new();
+    for _ in 0..257 {
+        events.push((0, on(0, 60, 127)));
+        events.push((96, on(0, 60, 0)));
+    }
+    events.push((96, end()));
+    let bytes = midi_bytes(Format::SingleTrack, 96, vec![events]);
+    assert!(midi::parse_midi(&bytes).is_err());
+}
+
+#[test]
+/// 한도 안의 악보에서는 재타건해도 원래 페달 음가를 그대로 유지하는지 검사합니다.
+fn ordinary_pedal_retriggers_preserve_original_shared_tails_and_held_keys() {
+    let bytes = midi_bytes(
+        Format::Parallel,
+        96,
+        vec![
+            vec![(0, cc(0, 64, 127)), (384, cc(0, 64, 0)), (384, end())],
+            vec![
+                (0, on(0, 60, 127)),
+                (0, on(0, 64, 100)),
+                (24, on(0, 60, 0)),
+                (24, on(0, 64, 0)),
+                (384, end()),
+            ],
+            vec![(48, on(0, 60, 100)), (240, on(0, 60, 0)), (384, end())],
+            vec![(96, on(0, 60, 64)), (120, on(0, 60, 0)), (384, end())],
+        ],
+    );
+    let score = midi::parse_midi(&bytes).unwrap();
+    assert_eq!(
+        note_keys(&score),
+        vec![
+            (0, 384, 60, 15),
+            (0, 384, 64, 12),
+            (48, 384, 60, 12),
+            (96, 384, 60, 8)
+        ]
+    );
+    assert_round_trip(&score);
+}
+
+#[test]
 /// 동음 NoteOff가 다른 원본 트랙의 음을 끝내지 않는지 검사합니다.
 fn same_key_note_offs_do_not_end_the_wrong_source_track() {
     let bytes = midi_bytes(

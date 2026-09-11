@@ -116,6 +116,7 @@ struct Transport {
 
 impl Transport {
     /// 저장된 위치·음량·선택 상태로 콜백용 재생기를 준비한다.
+    #[cfg(test)]
     fn new(
         timeline: Arc<Timeline>,
         sample_rate: u32,
@@ -124,9 +125,29 @@ impl Transport {
         revision: u64,
         audibility: Audibility,
     ) -> Self {
-        let mut renderer = Renderer::with_audibility(timeline, sample_rate, audibility);
+        Self::try_new(
+            timeline,
+            sample_rate,
+            snapshot,
+            volume,
+            revision,
+            audibility,
+        )
+        .expect("valid test timeline and installed sound banks")
+    }
+
+    /// 음원 오류를 호출자에게 반환하며 콜백용 재생기를 준비한다.
+    fn try_new(
+        timeline: Arc<Timeline>,
+        sample_rate: u32,
+        snapshot: PlaybackSnapshot,
+        volume: f32,
+        revision: u64,
+        audibility: Audibility,
+    ) -> Result<Self> {
+        let mut renderer = Renderer::try_with_audibility(timeline, sample_rate, audibility)?;
         renderer.seek(snapshot.position_seconds);
-        Self {
+        Ok(Self {
             renderer: Box::new(renderer),
             retired: None,
             state: snapshot.state,
@@ -135,7 +156,7 @@ impl Transport {
             current_volume: volume,
             volume_step: 1.0 / (sample_rate.max(1) as f32 * 0.01),
             revision,
-        }
+        })
     }
 
     /// 버퍼 경계에서 재생 명령을 순서대로 적용한다.
@@ -307,6 +328,14 @@ impl Player {
         if self.stream.is_none() {
             self.open_stream(timeline)?;
         }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(stream) = &self.stream {
+            let cpal::platform::StreamInner::WebAudio(stream) = stream.as_inner();
+            let _ = stream
+                .audio_context()
+                .resume()
+                .map_err(|error| anyhow!("오디오 재생을 재개할 수 없습니다: {error:?}"))?;
+        }
         if snapshot.position_seconds >= snapshot.total_seconds {
             snapshot.position_seconds = 0.0;
         }
@@ -347,10 +376,18 @@ impl Player {
             .zip(self.timeline.as_ref())
             .map(|(rate, timeline)| {
                 let mut renderer =
-                    Renderer::with_audibility(timeline.clone(), rate, self.audibility.clone());
+                    Renderer::try_with_audibility(timeline.clone(), rate, self.audibility.clone())?;
                 renderer.seek(snapshot.position_seconds);
-                Box::new(renderer)
-            });
+                Ok::<_, anyhow::Error>(Box::new(renderer))
+            })
+            .transpose();
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.pending_error = Some(format!("재생 위치를 변경할 수 없습니다: {error:#}"));
+                return;
+            }
+        };
         self.issue(
             Action::Seek {
                 seconds: snapshot.position_seconds,
@@ -499,6 +536,10 @@ impl Player {
 
     /// 기본 출력 장치를 선택하고 지원 형식에 맞는 스트림을 연다.
     fn open_stream(&mut self, timeline: Arc<Timeline>) -> Result<()> {
+        #[cfg(target_arch = "wasm32")]
+        if !crate::web_audio::ready() {
+            bail!("가상 악기를 먼저 불러와 주세요.");
+        }
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -507,7 +548,14 @@ impl Player {
             .default_output_config()
             .context("오디오 장치의 출력 설정을 읽을 수 없습니다.")?;
         let sample_format = supported.sample_format();
+        #[cfg(not(target_arch = "wasm32"))]
         let config: cpal::StreamConfig = supported.into();
+        #[cfg(target_arch = "wasm32")]
+        let config = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(44_100),
+            buffer_size: cpal::BufferSize::Fixed(2048),
+        };
         if config.channels == 0 || config.sample_rate.0 == 0 {
             bail!("오디오 장치가 유효하지 않은 출력 설정을 반환했습니다.");
         }
@@ -522,14 +570,14 @@ impl Player {
         let (retired_tx, retired_rx) = mpsc::channel();
         let snapshot = self.snapshot();
         let shared = Arc::new(Shared::new(snapshot, self.requested.revision));
-        let mut transport = Transport::new(
+        let mut transport = Transport::try_new(
             timeline,
             config.sample_rate.0,
             snapshot,
             self.volume,
             self.requested.revision,
             self.audibility.clone(),
-        );
+        )?;
         transport.retired = Some(retired_tx);
         let stream = match sample_format {
             cpal::SampleFormat::I8 => build_stream::<i8>(

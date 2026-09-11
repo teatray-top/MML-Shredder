@@ -9,6 +9,7 @@ use crate::core::{MIN_TICK, emit_part, track_from_mml};
 use crate::{Note, Score, Tempo, Tick};
 
 #[derive(Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", derive(serde::Serialize, serde::Deserialize))]
 pub struct SplitOptions {
     pub limit: usize,
     pub min_gap: Tick,

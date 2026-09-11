@@ -109,14 +109,16 @@ impl Instrument {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const SF2: &[u8] = include_bytes!("../assets/soundfonts/FluidR3/FluidR3_GM.sf2");
 static BANK: OnceLock<Arc<SoundFont>> = OnceLock::new();
 const BLOCK_SIZE: usize = 8;
 const MASTER_VOLUME: f32 = 0.25;
 
 /// 오디오 스트림을 열기 전에 공유 음원과 악기 존재 여부를 확인한다.
-fn load() -> &'static Arc<SoundFont> {
-    BANK.get_or_init(|| {
+fn load() -> Result<&'static Arc<SoundFont>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let bank = BANK.get_or_init(|| {
         let bank = SoundFont::new(&mut Cursor::new(SF2))
             .expect("the embedded and tested FluidR3 bank must be valid");
         for instrument in Instrument::ALL {
@@ -129,7 +131,38 @@ fn load() -> &'static Arc<SoundFont> {
             );
         }
         Arc::new(bank)
-    })
+    });
+    #[cfg(target_arch = "wasm32")]
+    let bank = BANK
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("가상 악기를 먼저 불러와 주세요."))?;
+    Ok(bank)
+}
+
+/// 내려받은 음원에 모든 미리듣기 악기가 있는지 확인해 공유한다.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn install(bytes: &[u8]) -> Result<()> {
+    if BANK.get().is_some() {
+        return Ok(());
+    }
+    let bank = SoundFont::new(&mut Cursor::new(bytes))?;
+    for instrument in Instrument::ALL {
+        anyhow::ensure!(
+            bank.get_presets().iter().any(|preset| {
+                preset.get_bank_number() == 0 && preset.get_patch_number() == instrument.program()
+            }),
+            "{} 가상 악기를 찾을 수 없습니다.",
+            instrument.name()
+        );
+    }
+    let _ = BANK.set(Arc::new(bank));
+    Ok(())
+}
+
+/// 브라우저의 악기 음원이 준비되었는지 확인한다.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn ready() -> bool {
+    BANK.get().is_some()
 }
 
 /// 파트별 엔진으로 동음 note-off를 격리하며 평상시에는 고정 버퍼로 렌더링한다.
@@ -150,7 +183,7 @@ impl PartSynth {
         // 파트 수와 별개로 겹치는 샘플층과 릴리스 꼬리의 음성을 미리 확보한다.
         settings.maximum_polyphony = 128;
         settings.enable_reverb_and_chorus = false;
-        let synth = Synthesizer::new(load(), &settings)?;
+        let synth = Synthesizer::new(load()?, &settings)?;
         let mut part = Self {
             synth,
             instrument: Instrument::default(),
@@ -251,7 +284,7 @@ mod tests {
     #[test]
     /// 모든 악기의 존재·출력·릴리스 상한을 확인한다.
     fn every_selected_patch_is_present_audible_and_has_a_bounded_release() {
-        let bank = load();
+        let bank = load().unwrap();
         let mut signatures = Vec::new();
         for instrument in Instrument::ALL {
             let preset = bank
