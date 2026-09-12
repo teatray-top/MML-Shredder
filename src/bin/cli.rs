@@ -3,8 +3,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mmlfold::{
-    core,
-    fold::{self, FoldOptions, Gain, Layout, VolumeRange},
+    fold::{FoldOptions, Gain, Layout, VolumeRange},
     input,
     split::SplitOptions,
     verify, workflow,
@@ -100,7 +99,13 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Import { src, out, force } => {
             let score = input::load_score(&src)?;
-            workflow::write_files(&[(out.clone(), core::serialize_mmi(&score))], force, &[src])?;
+            let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("score");
+            let result = workflow::source_export(&score, stem)?;
+            workflow::write_files(
+                &[(out.clone(), result.artifacts[0].text.clone())],
+                force,
+                &[src],
+            )?;
             println!("Saved: {}", out.display());
         }
         Command::Fold {
@@ -132,7 +137,8 @@ fn main() -> Result<()> {
                 LayoutArg::Roles => Layout::Roles,
                 LayoutArg::Learned => Layout::Learned,
             };
-            let result = fold::fold_score(
+            let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("score");
+            let result = workflow::arrange(
                 &score,
                 &FoldOptions {
                     tracks,
@@ -143,21 +149,17 @@ fn main() -> Result<()> {
                     lead_pitch,
                     lead_continuity,
                 },
+                stem,
+                track_files,
             )?;
-            let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("score");
             let report_text = result.report;
-            let mut files = vec![(out.clone(), core::serialize_mmi(&result.score))];
-            if track_files {
-                let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("mmi");
-                for (i, track) in result.score.tracks.iter().enumerate() {
-                    let mut single = result.score.clone();
-                    single.tracks = vec![track.clone()];
-                    single.tracks[0].meta.insert("name".into(), "Track1".into());
-                    files.push((
-                        out.with_file_name(format!("{stem}_t{}.{ext}", i + 1)),
-                        core::serialize_mmi(&single),
-                    ));
-                }
+            let mut files = vec![(out.clone(), result.artifacts[0].text.clone())];
+            let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("mmi");
+            for (index, artifact) in result.artifacts.iter().skip(1).enumerate() {
+                files.push((
+                    out.with_file_name(format!("{stem}_t{}.{ext}", index + 1)),
+                    artifact.text.clone(),
+                ));
             }
             if let Some(path) = report {
                 files.push((path, report_text.clone()));

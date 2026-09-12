@@ -9,6 +9,7 @@ mod harmony;
 pub mod input;
 pub mod instruments;
 pub mod midi;
+mod mobile;
 mod parallel;
 pub mod playback;
 mod salience;

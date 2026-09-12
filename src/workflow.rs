@@ -2,6 +2,7 @@
 use crate::{
     Score, core,
     fold::{self, FoldOptions},
+    mobile,
     split::{self, SplitOptions},
 };
 use anyhow::{Context, Result, bail};
@@ -98,16 +99,18 @@ pub struct WorkResult {
     pub split: Option<SplitPreview>,
 }
 
-/// 음표와 편성을 바꾸지 않고 입력 악보의 MMI 저장 결과를 만듭니다.
+/// 입력 악보의 편성을 유지하고 모바일에서 내보낼 수 있는 MMI를 만듭니다.
 pub fn source_export(score: &Score, stem: &str) -> Result<WorkResult> {
-    let game = game_export(score)?;
+    let (score, _) = mobile::prepare_score(score)?;
+    let game = game_export(&score)?;
+    let text = core::serialize_mmi(&score);
     Ok(WorkResult {
         kind: WorkKind::Import,
-        score: score.clone(),
+        score,
         report: String::new(),
         artifacts: vec![Artifact {
             name: format!("{stem}.mmi"),
-            text: core::serialize_mmi(score),
+            text,
             game_parts: game.parts,
             tempo_note_splits: game.tempo_note_splits,
         }],
@@ -122,7 +125,8 @@ pub fn arrange(
     stem: &str,
     track_files: bool,
 ) -> Result<WorkResult> {
-    let result = fold::fold_score(score, options)?;
+    let mut result = fold::fold_score(score, options)?;
+    (result.score, _) = mobile::prepare_score(&result.score)?;
     let game = game_export(&result.score)?;
     let report = result.report;
     let mut artifacts = vec![Artifact {
@@ -156,13 +160,18 @@ pub fn arrange(
 
 /// 악보를 분할하고 각 장의 MMI 파일 목록을 만듭니다.
 pub fn scrolls(score: &Score, options: &SplitOptions, stem: &str) -> Result<WorkResult> {
-    let result = split::split_score_python(score, options).or_else(|reference_error| {
-        // Python 호환 탐색이 표현 불가능한 조각에서 실패할 때만 무손실 분할로 대체합니다.
-        let mut result = split::split_score(score, options)
-            .with_context(|| format!("Python split could not encode this input: {reference_error:#}"))?;
-        result.report.push_str("\nPython 방식에서 표현할 수 없는 짧은 구간이 있어, 음표를 보존하는 절단점을 사용했습니다.\n");
-        Ok::<_, anyhow::Error>(result)
-    })?;
+    let (score, _) = mobile::prepare_score(score)?;
+    let result = match split::split_score_python(&score, options) {
+        Ok(result)
+            if result
+                .chunks
+                .iter()
+                .all(|chunk| mobile::score_is_compatible(&chunk.score)) =>
+        {
+            result
+        }
+        _ => split::split_score_mobile(&score, options)?,
+    };
     let preview = SplitPreview {
         limit: options.limit,
         chunks: result
@@ -191,7 +200,7 @@ pub fn scrolls(score: &Score, options: &SplitOptions, stem: &str) -> Result<Work
     let report = result.report;
     Ok(WorkResult {
         kind: WorkKind::Split,
-        score: score.clone(),
+        score,
         report,
         artifacts,
         split: Some(preview),

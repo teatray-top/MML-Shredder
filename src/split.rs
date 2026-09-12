@@ -148,7 +148,17 @@ fn text_widths(texts: &[Vec<String>]) -> Vec<usize> {
 }
 
 /// 구간의 모든 파트가 글자 수 한도 안에 들어가는지 확인합니다.
-fn fits(score: &Score, tempos: &[Tempo], a: Tick, b: Tick, limit: usize) -> Result<bool> {
+fn fits(
+    score: &Score,
+    tempos: &[Tempo],
+    a: Tick,
+    b: Tick,
+    limit: usize,
+    mobile: bool,
+) -> Result<bool> {
+    if mobile && !mobile_chunk_compatible(score, tempos, a, b) {
+        return Ok(false);
+    }
     Ok(text_widths(&chunk_text(score, tempos, a, b)?)
         .into_iter()
         .all(|width| width <= limit))
@@ -169,10 +179,30 @@ fn gaps(notes: &[Note], min_len: Tick) -> Vec<(Tick, Tick)> {
     result
 }
 
-// 긴 악보의 모든 틱을 나열하지 않고 유효 범위와 누적 순번만 저장합니다.
+struct CutRange {
+    start: Tick,
+    end: Tick,
+    prior: Tick,
+    period: Tick,
+    offsets: Vec<Tick>,
+}
+
+impl CutRange {
+    /// 지정한 틱까지 포함되는 유효 지점 수를 계산합니다.
+    fn count_through(&self, tick: Tick) -> Tick {
+        let length = (tick.min(self.end) - self.start + 1).max(0);
+        length / self.period * self.offsets.len() as Tick
+            + self
+                .offsets
+                .partition_point(|offset| *offset < length % self.period) as Tick
+    }
+}
+
+// 긴 악보의 모든 틱을 나열하지 않고 유효 범위와 반복 패턴의 누적 순번만 저장합니다.
 struct LegalCuts {
-    ranges: Vec<(Tick, Tick, Tick)>,
+    ranges: Vec<CutRange>,
     count: Tick,
+    mobile: bool,
 }
 
 impl LegalCuts {
@@ -180,47 +210,72 @@ impl LegalCuts {
     fn new(mut forbidden: Vec<(Tick, Tick)>, total: Tick) -> Self {
         forbidden.retain(|(a, b)| a <= b && *b >= 1 && *a < total);
         forbidden.sort_unstable();
-        let mut ranges = Vec::new();
+        let mut result = Self {
+            ranges: Vec::new(),
+            count: 0,
+            mobile: false,
+        };
         let mut next = 1;
-        let mut count = 0;
         for (a, b) in forbidden {
             let a = a.max(1);
             let b = b.min(total - 1);
             if next < a {
-                ranges.push((next, a - 1, count));
-                count += a - next;
+                result.push(next, a - 1, 1, vec![0]);
             }
             next = next.max(b + 1);
         }
         if next <= total {
-            ranges.push((next, total, count));
-            count += total - next + 1;
+            result.push(next, total, 1, vec![0]);
         }
-        Self { ranges, count }
+        result
+    }
+
+    /// 반복되는 허용 지점 패턴과 누적 순번을 추가합니다.
+    fn push(&mut self, start: Tick, end: Tick, period: Tick, offsets: Vec<Tick>) {
+        if offsets.is_empty() {
+            return;
+        }
+        let range = CutRange {
+            start,
+            end,
+            prior: self.count,
+            period,
+            offsets,
+        };
+        self.count += range.count_through(end);
+        self.ranges.push(range);
     }
 
     /// 유효 지점의 순번을 실제 틱으로 변환합니다.
     fn tick(&self, rank: Tick) -> Tick {
-        let i = self.ranges.partition_point(|(_, _, prior)| *prior <= rank) - 1;
-        let (a, _, prior) = self.ranges[i];
-        a + rank - prior
+        let i = self.ranges.partition_point(|range| range.prior <= rank) - 1;
+        let range = &self.ranges[i];
+        let local = rank - range.prior;
+        range.start
+            + local / range.offsets.len() as Tick * range.period
+            + range.offsets[(local % range.offsets.len() as Tick) as usize]
     }
 
     /// 지정한 틱 다음에 오는 첫 유효 지점의 순번을 구합니다.
     fn first_after(&self, tick: Tick) -> Tick {
-        let i = self.ranges.partition_point(|(_, b, _)| *b <= tick);
+        let i = self.ranges.partition_point(|range| range.end <= tick);
         match self.ranges.get(i) {
-            Some(&(a, _, prior)) => prior + (tick + 1 - a).max(0),
+            Some(range) => range.prior + range.count_through(tick),
             None => self.count,
         }
     }
 
     /// 지정한 틱이 유효한 분할 지점인지 확인합니다.
     fn contains(&self, tick: Tick) -> bool {
-        let i = self.ranges.partition_point(|(_, b, _)| *b < tick);
-        self.ranges
-            .get(i)
-            .is_some_and(|(a, b, _)| *a <= tick && tick <= *b)
+        let i = self.ranges.partition_point(|range| range.end < tick);
+        self.ranges.get(i).is_some_and(|range| {
+            range.start <= tick
+                && tick <= range.end
+                && range
+                    .offsets
+                    .binary_search(&((tick - range.start) % range.period))
+                    .is_ok()
+        })
     }
 }
 
@@ -273,6 +328,156 @@ fn legal_cuts(score: &Score, tempos: &[Tempo], total: Tick) -> LegalCuts {
         }
     }
     LegalCuts::new(forbidden, total)
+}
+
+/// 모바일에서 전체 음가와 템포로 나뉜 조각을 모두 표현할 수 있는지 확인합니다.
+fn mobile_span_compatible(start: Tick, end: Tick, tempos: &[Tempo]) -> bool {
+    if !crate::mobile::compatible_duration(end - start) {
+        return false;
+    }
+    let mut previous = start;
+    for &(tick, _) in tempos
+        .iter()
+        .filter(|(tick, _)| start < *tick && *tick < end)
+    {
+        if !crate::mobile::compatible_duration(tick - previous) {
+            return false;
+        }
+        previous = tick;
+    }
+    crate::mobile::compatible_duration(end - previous)
+}
+
+/// 장의 시작과 끝을 함께 적용한 음표·쉼표·템포 조각을 검사합니다.
+fn mobile_chunk_compatible(score: &Score, tempos: &[Tempo], a: Tick, b: Tick) -> bool {
+    for track in &score.tracks {
+        for (pi, notes) in track.parts.iter().enumerate() {
+            let tp = if pi == 0 { tempos } else { &[] };
+            let mut previous = a;
+            for note in notes.iter().filter(|note| note.off > a && note.on < b) {
+                let on = note.on.max(a);
+                let off = note.off.min(b);
+                if !mobile_span_compatible(previous, on, tp) || !mobile_span_compatible(on, off, tp)
+                {
+                    return false;
+                }
+                previous = off;
+            }
+            if let Some(&(last, _)) = tp
+                .iter()
+                .rev()
+                .find(|(tick, _)| previous < *tick && *tick < b)
+                && !mobile_span_compatible(previous, last, tp)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 모바일 절단점 검사에 필요한 원래 음가와 템포 조각을 모읍니다.
+fn mobile_spans(score: &Score, tempos: &[Tempo], total: Tick) -> Vec<(Tick, Tick)> {
+    let mut spans = Vec::new();
+    let mut add = |start: Tick, end: Tick, tp: &[Tempo]| {
+        if end <= start {
+            return;
+        }
+        spans.push((start, end));
+        let mut previous = start;
+        for &(tick, _) in tp.iter().filter(|(tick, _)| start < *tick && *tick < end) {
+            spans.push((previous, tick));
+            previous = tick;
+        }
+        if previous != start {
+            spans.push((previous, end));
+        }
+    };
+    for track in &score.tracks {
+        for (pi, notes) in track.parts.iter().enumerate() {
+            let tp = if pi == 0 { tempos } else { &[] };
+            let mut previous = 0;
+            for note in notes {
+                add(previous, note.on, tp);
+                add(note.on, note.off, tp);
+                previous = note.off;
+            }
+            if let Some(&(last, _)) = tp
+                .iter()
+                .rev()
+                .find(|(tick, _)| previous < *tick && *tick < total)
+            {
+                add(previous, last, tp);
+            }
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    spans
+}
+
+/// 긴 구간은 576틱 반복 패턴으로 저장하며 모바일에 안전한 공통 절단점을 고릅니다.
+fn mobile_legal_cuts(score: &Score, tempos: &[Tempo], total: Tick) -> LegalCuts {
+    let base = legal_cuts(score, tempos, total);
+    let spans = mobile_spans(score, tempos, total);
+    let mut changes: BTreeMap<Tick, Vec<(usize, bool)>> = BTreeMap::new();
+    changes.entry(1).or_default();
+    changes.entry(total + 1).or_default();
+    for range in &base.ranges {
+        changes.entry(range.start).or_default();
+        changes.entry(range.end + 1).or_default();
+    }
+    for (index, &(start, end)) in spans.iter().enumerate() {
+        if end - start > 1 {
+            changes.entry(start + 1).or_default().push((index, true));
+            changes.entry(end).or_default().push((index, false));
+        }
+        for point in [start.saturating_add(769), end.saturating_sub(768)] {
+            if start < point && point < end {
+                changes.entry(point).or_default();
+            }
+        }
+    }
+    let changes: Vec<_> = changes.into_iter().collect();
+    let mut active = BTreeSet::new();
+    let mut result = LegalCuts {
+        ranges: Vec::new(),
+        count: 0,
+        mobile: true,
+    };
+    for pair in changes.windows(2) {
+        let (start, updates) = &pair[0];
+        for &(index, added) in updates {
+            if added {
+                active.insert(index);
+            } else {
+                active.remove(&index);
+            }
+        }
+        let end = pair[1].0 - 1;
+        if !base.contains(*start) {
+            continue;
+        }
+        if active.is_empty() {
+            result.push(*start, end, 1, vec![0]);
+            continue;
+        }
+        let length = end - start + 1;
+        // 768틱을 넘는 조각은 MabiIcco에서 576틱씩 줄이므로 같은 나머지는 같은 결과입니다.
+        let period = if length > 768 { 576 } else { length };
+        let offsets = (0..period)
+            .filter(|offset| {
+                let tick = start + offset;
+                active.iter().all(|&index| {
+                    let (a, b) = spans[index];
+                    crate::mobile::compatible_duration(tick - a)
+                        && crate::mobile::compatible_duration(b - tick)
+                })
+            })
+            .collect();
+        result.push(*start, end, period, offsets);
+    }
+    result
 }
 
 /// 구간 길이에 따라 줄어들지 않는 최소 글자 수를 계산합니다.
@@ -335,14 +540,14 @@ fn furthest_fitting(
         "a musical event after tick {a} exceeds the {limit}-character limit; increase the limit"
     );
     let last_tick = legal.tick(upper - 1);
-    if !dead_ends.contains(&last_tick) && fits(score, tempos, a, last_tick, limit)? {
+    if !dead_ends.contains(&last_tick) && fits(score, tempos, a, last_tick, limit, legal.mobile)? {
         return Ok(last_tick);
     }
     // 기본 음가 압축으로 글자 수가 비단조적이므로 되돌아갈 때는 남은 후보를 모두 확인합니다.
     if exact {
         for rank in (first..upper).rev() {
             let tick = legal.tick(rank);
-            if !dead_ends.contains(&tick) && fits(score, tempos, a, tick, limit)? {
+            if !dead_ends.contains(&tick) && fits(score, tempos, a, tick, limit, legal.mobile)? {
                 return Ok(tick);
             }
         }
@@ -356,7 +561,7 @@ fn furthest_fitting(
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let tick = legal.tick(mid);
-        if fits(score, tempos, a, tick, limit)? {
+        if fits(score, tempos, a, tick, limit, legal.mobile)? {
             if !dead_ends.contains(&tick) {
                 best = Some(tick);
             }
@@ -369,7 +574,7 @@ fn furthest_fitting(
     if best.is_none() {
         for rank in first..upper {
             let tick = legal.tick(rank);
-            if !dead_ends.contains(&tick) && fits(score, tempos, a, tick, limit)? {
+            if !dead_ends.contains(&tick) && fits(score, tempos, a, tick, limit, legal.mobile)? {
                 best = Some(tick);
                 break;
             }
@@ -465,6 +670,20 @@ fn chunk_tail(tail: &[String], sigs: &BTreeMap<Tick, String>, a: Tick, b: Tick) 
 
 /// 음표 조각과 공통 시간축을 보존하며 악보를 분할합니다.
 pub fn split_score(score: &Score, options: &SplitOptions) -> Result<SplitResult> {
+    split_score_with_mode(score, options, false)
+}
+
+/// 전체 악보에서 보정된 음표 시점을 바꾸지 않고 모바일 호환 구간으로 나눕니다.
+pub(crate) fn split_score_mobile(score: &Score, options: &SplitOptions) -> Result<SplitResult> {
+    split_score_with_mode(score, options, true)
+}
+
+/// 출력 대상의 음가 조건에 맞는 공통 분할 지점을 계획합니다.
+fn split_score_with_mode(
+    score: &Score,
+    options: &SplitOptions,
+    mobile: bool,
+) -> Result<SplitResult> {
     ensure!(options.limit > 0, "character limit must be positive");
     ensure!(
         options.min_gap >= 0 && options.big_gap >= 0,
@@ -495,7 +714,15 @@ pub fn split_score(score: &Score, options: &SplitOptions) -> Result<SplitResult>
     // 원본 인코딩 오류를 경계 이동으로 해결 가능한 분할 오류와 구분합니다.
     chunk_text(score, &tempos, 0, total)
         .context("the input cannot be encoded without changing note timing")?;
-    let legal = legal_cuts(score, &tempos, total);
+    ensure!(
+        !mobile || mobile_chunk_compatible(score, &tempos, 0, total),
+        "the input must be prepared for mobile before splitting"
+    );
+    let legal = if mobile {
+        mobile_legal_cuts(score, &tempos, total)
+    } else {
+        legal_cuts(score, &tempos, total)
+    };
     let candidates = gaps(&all_notes, options.min_gap);
     let gap_map: BTreeMap<_, _> = gaps(&all_notes, 1).into_iter().collect();
     let sigs = signatures(&score.tail);
@@ -552,7 +779,7 @@ pub fn split_score(score: &Score, options: &SplitOptions) -> Result<SplitResult>
             far.sort_unstable_by_key(|(g, _)| std::cmp::Reverse(*g));
             let mut tried = BTreeSet::new();
             for (gap, _) in near.into_iter().chain(far) {
-                if tried.insert(gap) && fits(score, &tempos, pos, gap, options.limit)? {
+                if tried.insert(gap) && fits(score, &tempos, pos, gap, options.limit, mobile)? {
                     end = gap;
                     break;
                 }
@@ -569,9 +796,16 @@ pub fn split_score(score: &Score, options: &SplitOptions) -> Result<SplitResult>
         }
         let mut tracks = Vec::new();
         for (ti, (original, parts)) in score.tracks.iter().zip(&texts).enumerate() {
+            let mut meta = original.meta.clone();
+            if mobile {
+                meta.insert("name".into(), format!("Track{}", ti + 1));
+                for key in ["program", "songProgram", "panpot", "visible"] {
+                    meta.entry(key.into()).or_default();
+                }
+            }
             tracks.push(track_from_mml(
                 format!("MML@{};", parts.join(",")),
-                original.meta.clone(),
+                meta,
                 ti,
             )?);
         }
@@ -767,4 +1001,186 @@ pub(crate) fn split_score_python(score: &Score, options: &SplitOptions) -> Resul
         );
     }
     Ok(SplitResult { chunks, report })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Track;
+
+    /// 파트와 공통 템포로 분할 검사 악보를 만듭니다.
+    fn score(parts: Vec<Vec<Note>>, tempos: Vec<Tempo>) -> Score {
+        Score {
+            head: vec!["[mml-score]".into()],
+            tracks: vec![Track {
+                parts,
+                tempos,
+                ..Track::default()
+            }],
+            ..Score::default()
+        }
+    }
+
+    /// 지정한 구간과 성부 번호의 음표를 만듭니다.
+    fn note(on: Tick, off: Tick, pitch: i32, part: usize) -> Note {
+        Note {
+            on,
+            off,
+            pitch,
+            vel: 12,
+            src: (0, part),
+        }
+    }
+
+    #[test]
+    /// 주기형 절단점이 직접 검사와 일치하고 32틱 셋잇단음 경계를 허용하는지 확인합니다.
+    fn mobile_cut_ranges_match_direct_fragment_checks() {
+        let source = score(
+            vec![vec![note(0, 384, 72, 0)], vec![note(8, 344, 48, 1)]],
+            vec![(0, 120), (192, 90)],
+        );
+        let tempos = source.tempos();
+        let base = legal_cuts(&source, &tempos, 384);
+        let legal = mobile_legal_cuts(&source, &tempos, 384);
+        let spans = mobile_spans(&source, &tempos, 384);
+        let expected: Vec<_> = (1..=384)
+            .filter(|&tick| {
+                base.contains(tick)
+                    && spans.iter().all(|&(a, b)| {
+                        tick <= a
+                            || tick >= b
+                            || (crate::mobile::compatible_duration(tick - a)
+                                && crate::mobile::compatible_duration(b - tick))
+                    })
+            })
+            .collect();
+        assert_eq!(legal.count as usize, expected.len());
+        for (rank, &tick) in expected.iter().enumerate() {
+            assert_eq!(legal.tick(rank as Tick), tick);
+            assert_eq!(legal.first_after(tick), rank as Tick + 1);
+        }
+        for tick in 0..=384 {
+            assert_eq!(legal.contains(tick), expected.contains(&tick));
+            assert_eq!(
+                legal.first_after(tick) as usize,
+                expected.partition_point(|t| *t <= tick)
+            );
+        }
+        assert!(legal.contains(32));
+        assert!(!legal.contains(19));
+    }
+
+    #[test]
+    /// 개별 절단점이 유효해도 두 절단점 사이에 생기는 19틱 조각은 거부합니다.
+    fn mobile_chunk_checks_the_interval_between_two_cuts() {
+        let source = score(vec![vec![note(0, 384, 60, 0)]], vec![(0, 120)]);
+        let tempos = source.tempos();
+        let legal = mobile_legal_cuts(&source, &tempos, 384);
+        assert!(legal.contains(8));
+        assert!(legal.contains(27));
+        assert!(!fits(&source, &tempos, 8, 27, 100, true).unwrap());
+    }
+
+    #[test]
+    /// 긴 구간의 모든 틱을 저장하지 않고 576틱 패턴으로 정확히 조회하는지 확인합니다.
+    fn mobile_cut_ranges_stay_compact_for_billion_tick_holds() {
+        let total = 576 * 10_000_000 + 384;
+        let source = score(vec![vec![note(0, total, 60, 0)]], vec![(0, 120)]);
+        let legal = mobile_legal_cuts(&source, &source.tempos(), total);
+        assert!(legal.ranges.len() < 12);
+        assert!(legal.ranges.iter().map(|r| r.offsets.len()).sum::<usize>() < 2400);
+        assert!(legal.count > 1_000_000);
+        for rank in [0, 1, legal.count / 2, legal.count - 2, legal.count - 1] {
+            let tick = legal.tick(rank);
+            assert!(legal.contains(tick));
+            assert!(crate::mobile::compatible_duration(tick));
+            assert!(crate::mobile::compatible_duration(total - tick));
+            assert_eq!(legal.first_after(tick), rank + 1);
+        }
+    }
+
+    #[test]
+    /// 여러 반복 주기를 넘는 지속음도 장마다 길이를 바꾸지 않고 끝까지 복원합니다.
+    fn mobile_long_hold_splits_without_losing_or_accumulating_ticks() {
+        let total = 576 * 32 + 384;
+        let source = score(vec![vec![note(0, total, 60, 0)]], vec![(0, 120)]);
+        let result = split_score_mobile(
+            &source,
+            &SplitOptions {
+                limit: 12,
+                ..SplitOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(result.chunks.len() > 1);
+        let mut end = 0;
+        for chunk in &result.chunks {
+            assert_eq!(chunk.start, end);
+            assert!(crate::mobile::score_is_compatible(&chunk.score));
+            assert_eq!(
+                chunk.score.all_notes(),
+                vec![note(0, chunk.end - chunk.start, 60, 0)]
+            );
+            assert!(chunk.widths.iter().all(|width| *width <= 12));
+            end = chunk.end;
+        }
+        assert_eq!(end, total);
+    }
+
+    #[test]
+    /// 모든 장의 음표·템포를 같은 절대 시점에 보존하고 실제 글자 수와 모바일 음가를 검사합니다.
+    fn mobile_split_preserves_triplets_bass_and_tempo_without_per_chunk_retiming() {
+        let upper = (0..48)
+            .map(|i| note(i * 32, (i + 1) * 32, 60 + (i % 7) as i32, 0))
+            .collect();
+        let source = score(
+            vec![
+                upper,
+                vec![note(0, 1536, 36, 1)],
+                vec![
+                    note(64, 128, 48, 2),
+                    note(256, 384, 55, 2),
+                    note(640, 768, 52, 2),
+                ],
+            ],
+            vec![(0, 120), (320, 90), (960, 150)],
+        );
+        assert!(crate::mobile::score_is_compatible(&source));
+        let result = split_score_mobile(
+            &source,
+            &SplitOptions {
+                limit: 32,
+                ..SplitOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(result.chunks.len() > 1);
+        let mut previous = 0;
+        for chunk in &result.chunks {
+            assert_eq!(chunk.start, previous);
+            assert!(chunk.end > chunk.start);
+            assert!(crate::mobile::score_is_compatible(&chunk.score));
+            assert!(chunk.widths.iter().all(|width| *width <= 32));
+            assert!(
+                chunk
+                    .mml_parts
+                    .iter()
+                    .flatten()
+                    .all(|text| text.chars().count() <= 32)
+            );
+            assert_eq!(
+                chunk.score.tempos(),
+                local_tempos(&source.tempos(), chunk.start, chunk.end)
+            );
+            for (source_part, part) in source.tracks[0]
+                .parts
+                .iter()
+                .zip(&chunk.score.tracks[0].parts)
+            {
+                assert_eq!(*part, slice_notes(source_part, chunk.start, chunk.end));
+            }
+            previous = chunk.end;
+        }
+        assert_eq!(previous, source.total_ticks());
+    }
 }
